@@ -23,6 +23,7 @@ mod data;
 mod input;
 mod metadata;
 mod output;
+mod rewrite;
 
 #[derive(Copy, Clone)]
 pub struct QueryDriver {

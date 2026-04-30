@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+* Generalized `{...}` placeholder syntax in `query!`, `query_as!`, `query_scalar!`, and their `_unchecked` / `_file` variants (#875). Forms:
+  * `{0}`, `{1}` — positional by index.
+  * `{name}` — matches `name = expr` in the args list, or implicitly captures the caller's local `name` (like `format!`).
+  * `{ids*}` / `{ids+}` — spreads `IN (...)` lists; `*` empties to nothing, `+` to `NULL`.
+  * `{(expr)}` — arbitrary parenthesized Rust expression evaluated at the call site.
+  * `..rest` arg-spread (#591): when `..my_struct` is in the args list, every unmatched `{name}` is looked up as `my_struct.name`. Explicit named args still win; to inline-capture a scope-local `name` alongside `..rest`, name it explicitly (`query!("...", ..rest, name = name)`).
+
+  `{{` / `}}` are literal braces. Braces inside SQL string literals, comments, and Postgres dollar-quoted blocks are left alone. Mixing native (`$N`, `?`) and `{...}` placeholders in one query is a compile-time error. SQL containing no `{` characters is passed through verbatim.
+
 ## 0.9.0-alpha.1 - 2025-10-14
 
 Accumulated changes since the beginning of the alpha cycle. Effectively a draft CHANGELOG for the 0.9.0 release.

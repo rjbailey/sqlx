@@ -129,6 +129,68 @@
 /// * Postgres: `$N` where `N` is the 1-based positional argument index
 /// * MySQL/SQLite: `?` which matches arguments in order that it appears in the query
 ///
+/// ## Generalized `{...}` Placeholder Syntax
+///
+/// As an alternative to the database-native syntax above, you can use a single
+/// portable `{...}` placeholder that the macro rewrites to the right native form
+/// per database. SQL containing no `{` characters is passed through verbatim,
+/// so the new syntax is fully opt-in.
+///
+/// ```rust,ignore
+/// // Positional, by index:
+/// sqlx::query!("SELECT * FROM users WHERE id = {0}", 42i32);
+///
+/// // Named:
+/// sqlx::query!("SELECT * FROM users WHERE id = {id}", id = 42i32);
+///
+/// // Inline capture: `{name}` with no matching arg picks up the caller's local.
+/// let id = 42i32;
+/// sqlx::query!("SELECT * FROM users WHERE id = {id}");
+///
+/// // Array spread for `IN (...)`. `{ids*}` empties to nothing (which yields
+/// // invalid `IN ()` SQL on most databases); `{ids+}` empties to `NULL`. Use
+/// // `{ids+}` if your input may be empty.
+/// let ids: Vec<i32> = vec![1, 2, 3];
+/// sqlx::query!("SELECT * FROM users WHERE id IN ({ids*})", ids = &ids);
+///
+/// // Arbitrary parenthesized Rust expression:
+/// struct Filter { id: i32 }
+/// let f = Filter { id: 42 };
+/// sqlx::query!("SELECT * FROM users WHERE id = {(f.id)}");
+///
+/// // `..rest` arg-spread: an unmatched `{name}` is looked up as `rest.name`.
+/// struct UserPatch { id: i32, name: String }
+/// let patch = UserPatch { id: 7, name: "alice".into() };
+/// sqlx::query!("UPDATE users SET name = {name} WHERE id = {id}", ..patch);
+/// ```
+///
+/// `{{` / `}}` are literal `{` / `}`. Braces inside SQL string literals,
+/// comments, and Postgres dollar-quoted blocks are left alone. Mixing native
+/// placeholders (`$N`, `?`) and `{...}` in the same query is a compile-time
+/// error.
+///
+/// **Resolution order.** Without `..rest`, a `{name}` placeholder resolves to
+/// an explicit `name = expr` arg if present, otherwise to a scope-local `name`
+/// from the caller (inline capture). With `..rest` in the args list, explicit
+/// `name = expr` args still take precedence; every other `{name}` is looked up
+/// as `rest.name` (a compile error if `rest` lacks the field). Inline capture
+/// is only available without `..rest`; to combine the two, name the local
+/// explicitly: `query!("...", ..rest, name = name)`.
+///
+/// **Reserved keywords.** Named placeholder bodies must be valid (ASCII) Rust
+/// identifiers. To use a Rust keyword (`type`, `match`, etc.) as a name, write
+/// it with the `r#`-prefix in the named arg: `query!("SELECT {type}", r#type
+/// = 5)`. The `{type}` placeholder body itself does not need the prefix.
+///
+/// **Multi-evaluation.** Like `format!`, each placeholder reference clones (and
+/// re-evaluates at runtime) the bound expression. If a placeholder is
+/// referenced more than once, move expensive computation into a `let` binding
+/// upstream.
+///
+/// **`{(expr)}` body limits.** The body is parsed as a Rust expression with
+/// balanced parentheses; it cannot contain unbalanced `}` (including inside
+/// Rust string literals). For complex expressions, extract them into a `let`.
+///
 /// ## Nullability: Bind Parameters
 /// For a given expected type `T`, both `T` and `Option<T>` are allowed (as well as either
 /// behind references). `Option::None` will be bound as `NULL`, so if binding a type behind `Option`

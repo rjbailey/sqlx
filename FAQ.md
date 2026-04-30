@@ -279,13 +279,27 @@ This is also pending a redesign to make it easier to discover and utilize.
 ----------------------------------------------------------------
 ### How can I do a `SELECT ... WHERE foo IN (...)` query?
 
+The portable way that works on every database is the `{ids*}` / `{ids+}` array-spread
+placeholder added in 0.9 (see issue #875):
 
-In the future SQLx will support binding arrays as a comma-separated list for every database,
-but unfortunately there's no general solution for that currently in SQLx itself.
-You would need to manually generate the query, at which point it
-cannot be used with the macros.
+```rust
+let ids: Vec<i32> = vec![1, 2, 3];
 
-However, **in Postgres** you can work around this limitation by binding the arrays directly and using `= ANY()`:
+// `{ids*}` expands to `?, ?, ?` on MySQL/SQLite or `$1, $2, $3` on Postgres.
+// An empty array expands to nothing (the SQL would become `IN ()`, which is invalid;
+// use `{ids+}` instead if you need an empty array to match nothing).
+let rows = sqlx::query!(
+    "SELECT * FROM foo WHERE id IN ({ids*})",
+    ids = &ids,
+)
+.fetch_all(&db)
+.await?;
+
+// `{ids+}` expands to `NULL` for an empty array (matches no rows).
+```
+
+**In Postgres** you can also use `= ANY()` with a bound array, which avoids generating
+a different query for each possible array length:
 
 ```rust
 let db: PgPool = /* ... */;
@@ -300,9 +314,9 @@ let foos = sqlx::query!(
     .await?;
 ```
 
-Even when SQLx gains generic placeholder expansion for arrays, this will still be the optimal way to do it for Postgres,
-as comma-expansion means each possible length of the array generates a different query 
-(and represents a combinatorial explosion if more than one array is used).
+`= ANY()` is still the better choice for Postgres than the portable `{ids*}` form, since
+comma-expansion generates a different prepared statement for each possible array length —
+a combinatorial explosion when more than one array is involved.
 
 Note that you can use any operator that returns a boolean, but beware that `!= ANY($1)` is **not equivalent** to `NOT IN (...)` as it effectively works like this:
 

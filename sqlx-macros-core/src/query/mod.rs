@@ -158,16 +158,36 @@ fn expand_with<DB: DatabaseExt>(
 where
     Describe<DB>: DescribeExt,
 {
+    let parsed = sqlx_core::placeholders::parse_query(&input.sql).map_err(|e| {
+        syn::Error::new(
+            input.subspan(e.byte_position..e.byte_position),
+            e.to_string(),
+        )
+    })?;
+    let rewrite_out = rewrite::rewrite(
+        &parsed,
+        &input.arg_exprs,
+        &input.named_args,
+        input.rest_arg.as_ref(),
+        DB::PLACEHOLDER_CHAR,
+        DB::PARAM_INDEXING,
+        |range| input.subspan(range),
+    )
+    .map_err(|e| syn::Error::new(input.subspan(e.byte_range.clone()), e.message))?;
+
     let (query_data, save_dir): (QueryData<DB>, Option<&Path>) = match data_source {
         // If the build is offline, the cache is our input so it's pointless to also write data for it.
         QueryDataSource::Cached(dyn_data) => (QueryData::from_dyn_data(dyn_data)?, None),
         QueryDataSource::Live { database_url, .. } => {
-            let describe = DB::describe_blocking(&input.sql, database_url, &config.drivers)?;
+            let describe =
+                DB::describe_blocking(&rewrite_out.describe_sql, database_url, &config.drivers)?;
+            // The cache is keyed on `input.sql` (the user's source SQL) — that's
+            // the only stable identifier across describe rewrites.
             (QueryData::from_describe(&input.sql, describe), offline_dir)
         }
     };
 
-    expand_with_data(config, input, query_data, save_dir)
+    expand_with_data(config, input, query_data, rewrite_out, save_dir)
 }
 
 // marker trait for `Describe` that lets us conditionally require it to be `Serialize + Deserialize`
@@ -188,30 +208,41 @@ fn expand_with_data<DB: DatabaseExt>(
     config: &Config,
     input: QueryMacroInput,
     data: QueryData<DB>,
+    rewrite_out: rewrite::RewriteOutput,
     save_dir: Option<&Path>,
 ) -> crate::Result<TokenStream>
 where
     Describe<DB>: DescribeExt,
 {
-    // validate at the minimum that our args match the query's input parameters
+    // Validate that our bindings match the query's parameter count. Skipped
+    // when any spread is present — each spread collapses to one placeholder in
+    // describe but expands to N at runtime, so the runtime is the authoritative
+    // check (`Arguments::add` and the database protocol).
     let num_parameters = match data.describe.parameters() {
         Some(Either::Left(params)) => Some(params.len()),
         Some(Either::Right(num)) => Some(num),
-
         None => None,
     };
-
     if let Some(num) = num_parameters {
-        if num != input.arg_exprs.len() {
-            return Err(
-                format!("expected {} parameters, got {}", num, input.arg_exprs.len()).into(),
-            );
+        if !rewrite_out.has_spread() && num != rewrite_out.bindings.len() {
+            return Err(format!(
+                "expected {} parameters, got {}",
+                num,
+                rewrite_out.bindings.len()
+            )
+            .into());
         }
     }
 
     let mut warnings = Warnings::default();
 
-    let args_tokens = args::quote_args(&input, config, &mut warnings, &data.describe)?;
+    let (args_tokens, sql_expr) = args::quote_args_and_sql::<DB>(
+        &input,
+        &rewrite_out,
+        config,
+        &mut warnings,
+        &data.describe,
+    )?;
 
     let query_args = format_ident!("query_args");
 
@@ -222,10 +253,9 @@ where
         .all(|it| it.type_info().is_void())
     {
         let db_path = DB::db_path();
-        let sql = &input.sql;
 
         quote! {
-            ::sqlx::__query_with_result::<#db_path, _>(#sql, #query_args)
+            ::sqlx::__query_with_result::<#db_path, _>(#sql_expr, #query_args)
         }
     } else {
         match input.record_type {
@@ -258,6 +288,7 @@ where
 
                 record_tokens.extend(output::quote_query_as::<DB>(
                     &input,
+                    &sql_expr,
                     &record_name,
                     &query_args,
                     &columns,
@@ -268,10 +299,11 @@ where
             RecordType::Given(ref out_ty) => {
                 let columns = output::columns_to_rust::<DB>(&data.describe, config, &mut warnings)?;
 
-                output::quote_query_as::<DB>(&input, out_ty, &query_args, &columns)
+                output::quote_query_as::<DB>(&input, &sql_expr, out_ty, &query_args, &columns)
             }
             RecordType::Scalar => output::quote_query_scalar::<DB>(
                 &input,
+                &sql_expr,
                 config,
                 &mut warnings,
                 &query_args,

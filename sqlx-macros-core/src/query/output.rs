@@ -138,6 +138,7 @@ fn column_to_rust<DB: DatabaseExt>(
 
 pub fn quote_query_as<DB: DatabaseExt>(
     input: &QueryMacroInput,
+    sql_expr: &TokenStream,
     out_ty: &Type,
     bind_args: &Ident,
     columns: &[RustColumn],
@@ -184,16 +185,8 @@ pub fn quote_query_as<DB: DatabaseExt>(
     let db_path = DB::db_path();
     let row_path = DB::row_path();
 
-    // if this query came from a file, use `include_str!()` to tell the compiler where it came from
-    let sql = if let Some(ref path) = &input.file_path {
-        quote::quote_spanned! { input.src_span => include_str!(#path) }
-    } else {
-        let sql = &input.sql;
-        quote! { #sql }
-    };
-
     quote! {
-        ::sqlx::__query_with_result::<#db_path, _>(#sql, #bind_args).try_map(|row: #row_path| {
+        ::sqlx::__query_with_result::<#db_path, _>(#sql_expr, #bind_args).try_map(|row: #row_path| {
             use ::sqlx::Row as _;
 
             #(#instantiations)*
@@ -205,6 +198,7 @@ pub fn quote_query_as<DB: DatabaseExt>(
 
 pub fn quote_query_scalar<DB: DatabaseExt>(
     input: &QueryMacroInput,
+    sql_expr: &TokenStream,
     config: &Config,
     warnings: &mut Warnings,
     bind_args: &Ident,
@@ -235,10 +229,9 @@ pub fn quote_query_scalar<DB: DatabaseExt>(
     };
 
     let db = DB::db_path();
-    let query = &input.sql;
 
     Ok(quote! {
-        ::sqlx::__query_scalar_with_result::<#db, #ty, _>(#query, #bind_args)
+        ::sqlx::__query_scalar_with_result::<#db, #ty, _>(#sql_expr, #bind_args)
     })
 }
 

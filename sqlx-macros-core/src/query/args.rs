@@ -1,108 +1,259 @@
 use crate::database::DatabaseExt;
+use crate::query::rewrite::{Binding, BindingRef, BindingRefKind, RewriteOutput, RuntimeTemplate};
 use crate::query::{QueryMacroInput, Warnings};
 use either::Either;
-use proc_macro2::TokenStream;
+use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote, quote_spanned};
 use sqlx_core::config::Config;
 use sqlx_core::describe::Describe;
+use sqlx_core::placeholders::Kleene;
 use sqlx_core::type_checking;
 use sqlx_core::type_info::TypeInfo;
 use syn::spanned::Spanned;
 use syn::{Expr, ExprCast, ExprGroup, Type};
 
-/// Returns a tokenstream which typechecks the arguments passed to the macro
-/// and binds them to `DB::Arguments` with the ident `query_args`.
-pub fn quote_args<DB: DatabaseExt>(
+/// Build the bind-setup tokens and the SQL expression for a query.
+///
+/// Returns `(setup, sql_expr)`, where:
+/// - `setup` is a sequence of statements that introduces a local binding
+///   `query_args: Result<DB::Arguments, BoxDynError>`.
+/// - `sql_expr` evaluates to a value implementing `SqlSafeStr`: a `&'static str`
+///   in the common case, or `AssertSqlSafe<String>` when any spread placeholder
+///   forces the SQL to be built at runtime.
+pub fn quote_args_and_sql<DB: DatabaseExt>(
+    input: &QueryMacroInput,
+    rewrite_out: &RewriteOutput,
+    config: &Config,
+    warnings: &mut Warnings,
+    info: &Describe<DB>,
+) -> crate::Result<(TokenStream, TokenStream)> {
+    let db_path = DB::db_path();
+
+    let param_types = describe_param_types::<DB>(input, config, warnings, info)?;
+
+    if rewrite_out.bindings.is_empty() {
+        let sql_expr = static_sql_expr(input, rewrite_out);
+        let setup = quote! {
+            let query_args = ::core::result::Result::<_, ::sqlx::error::BoxDynError>::Ok(
+                <#db_path as ::sqlx::database::Database>::Arguments::default(),
+            );
+        };
+        return Ok((setup, sql_expr));
+    }
+
+    // Per-binding setup: `let __sqlx_argN = &(expr)` plus an `if false { ... }`
+    // type-check block when describe gave us a parameter type. The type-check
+    // block makes `cargo check` reject mismatches at compile time without ever
+    // running.
+    let arg_names: Vec<Ident> = (0..rewrite_out.bindings.len())
+        .map(|i| format_ident!("__sqlx_arg{i}"))
+        .collect();
+    let binding_setup = bind_locals(&rewrite_out.bindings, &arg_names, &param_types);
+
+    match &rewrite_out.runtime_template {
+        RuntimeTemplate::Static(sql) => {
+            let sql_lit = Literal::string(sql);
+            let setup = static_setup(&db_path, &arg_names, binding_setup);
+            Ok((setup, quote! { #sql_lit }))
+        }
+        RuntimeTemplate::Pieces {
+            literals,
+            bindings: piece_bindings,
+        } => {
+            let setup = pieces_setup(
+                &db_path,
+                &arg_names,
+                literals,
+                piece_bindings,
+                binding_setup,
+            );
+            Ok((setup, quote! { ::sqlx::AssertSqlSafe(__sqlx_sql) }))
+        }
+    }
+}
+
+// Resolve describe-reported parameter types. `None` for MySQL/SQLite (no per-param
+// types from describe) and for `*_unchecked!()` macros.
+fn describe_param_types<DB: DatabaseExt>(
     input: &QueryMacroInput,
     config: &Config,
     warnings: &mut Warnings,
     info: &Describe<DB>,
-) -> crate::Result<TokenStream> {
-    let db_path = DB::db_path();
+) -> crate::Result<Option<Vec<TokenStream>>> {
+    match info.parameters() {
+        None | Some(Either::Right(_)) => Ok(None),
+        Some(Either::Left(_)) if !input.checked => Ok(None),
+        Some(Either::Left(params)) => params
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| get_param_type::<DB>(ty, config, warnings, i))
+            .collect::<crate::Result<_>>()
+            .map(Some),
+    }
+}
 
-    if input.arg_exprs.is_empty() {
-        return Ok(quote! {
-            let query_args = ::core::result::Result::<_, ::sqlx::error::BoxDynError>::Ok(<#db_path as ::sqlx::database::Database>::Arguments::default());
-        });
+// Per-binding setup: a `let __sqlx_argN = &(expr);` plus the type-check block.
+fn bind_locals(
+    bindings: &[Binding],
+    names: &[Ident],
+    param_types: &Option<Vec<TokenStream>>,
+) -> TokenStream {
+    let mut out = TokenStream::new();
+    for (i, (binding, name)) in bindings.iter().zip(names).enumerate() {
+        let param_ty = param_types.as_ref().and_then(|v| v.get(i).cloned());
+        let (expr, ty_check) = match binding {
+            Binding::Single(e) => (e, single_type_check(e, name, param_ty)),
+            Binding::Spread(e) => (e, spread_type_check(e, name, param_ty)),
+        };
+        let stripped = strip_wildcard(expr.clone());
+        out.extend(quote! { let #name = &(#stripped); });
+        out.extend(ty_check);
+    }
+    out
+}
+
+fn single_type_check(expr: &Expr, name: &Ident, param_ty: Option<TokenStream>) -> TokenStream {
+    let Some(param_ty) = param_ty else {
+        return TokenStream::new();
+    };
+    if get_type_override(expr).is_some() {
+        // The user wrote `expr as Ty`; let the cast itself enforce the type.
+        return TokenStream::new();
+    }
+    quote_spanned!(expr.span() =>
+        #[allow(clippy::missing_panics_doc, clippy::unreachable)]
+        if false {
+            use ::sqlx::ty_match::{WrapSameExt as _, MatchBorrowExt as _};
+            let expr = ::sqlx::ty_match::dupe_value(#name);
+            let ty_check = ::sqlx::ty_match::WrapSame::<#param_ty, _>::new(&expr).wrap_same();
+            let (mut _ty_check, match_borrow) = ::sqlx::ty_match::MatchBorrow::new(ty_check, &expr);
+            _ty_check = match_borrow.match_borrow();
+            ::std::unreachable!();
+        }
+    )
+}
+
+fn spread_type_check(expr: &Expr, name: &Ident, elem_ty: Option<TokenStream>) -> TokenStream {
+    let Some(elem_ty) = elem_ty else {
+        return TokenStream::new();
+    };
+    quote_spanned!(expr.span() =>
+        #[allow(clippy::missing_panics_doc, clippy::unreachable)]
+        if false {
+            use ::sqlx::ty_match::{WrapSameExt as _, MatchBorrowExt as _};
+            for elem in (::sqlx::ty_match::dupe_value(#name)).into_iter() {
+                let ty_check = ::sqlx::ty_match::WrapSame::<#elem_ty, _>::new(&elem).wrap_same();
+                let (mut _ty_check, match_borrow) = ::sqlx::ty_match::MatchBorrow::new(ty_check, &elem);
+                _ty_check = match_borrow.match_borrow();
+                ::std::unreachable!();
+            }
+        }
+    )
+}
+
+// Setup for the no-spread path: `$N` / `?` are baked into the SQL at macro time,
+// so we just `add` each binding in declaration order.
+fn static_setup(db_path: &syn::Path, names: &[Ident], binding_setup: TokenStream) -> TokenStream {
+    let n = names.len();
+    let size_hint = names
+        .iter()
+        .map(|n| quote! { + ::sqlx::encode::Encode::<#db_path>::size_hint(#n) });
+    let bind_calls = names.iter().map(|name| {
+        quote! {
+            let query_args = query_args.and_then(move |mut query_args| {
+                query_args.add(#name).map(move |()| query_args)
+            });
+        }
+    });
+    quote! {
+        #binding_setup
+        let mut query_args = <#db_path as ::sqlx::database::Database>::Arguments::default();
+        query_args.reserve(#n, 0 #(#size_hint)*);
+        let query_args = ::core::result::Result::<_, ::sqlx::error::BoxDynError>::Ok(query_args);
+        #(#bind_calls)*
+    }
+}
+
+// Setup for the spread path: build SQL and bind in lockstep at runtime so each
+// spread element advances `Arguments::buffer.count` (which Postgres'
+// `format_placeholder` reads to produce `$N`).
+fn pieces_setup(
+    db_path: &syn::Path,
+    names: &[Ident],
+    literals: &[String],
+    piece_bindings: &[BindingRef],
+    binding_setup: TokenStream,
+) -> TokenStream {
+    let cap_hint: usize = literals.iter().map(String::len).sum::<usize>() + 16;
+    let mut body = TokenStream::new();
+
+    for (idx, lit) in literals.iter().enumerate() {
+        let lit_tok = Literal::string(lit);
+        body.extend(quote! { __sqlx_sql.push_str(#lit_tok); });
+        if let Some(bref) = piece_bindings.get(idx) {
+            let name = &names[bref.binding_index];
+            body.extend(match &bref.kind {
+                BindingRefKind::Single => quote! {
+                    __sqlx_args.add(#name)?;
+                    __sqlx_args
+                        .format_placeholder(&mut __sqlx_sql)
+                        .expect("writing to String is infallible");
+                },
+                BindingRefKind::Spread(kleene) => {
+                    let empty_filler = match kleene {
+                        Kleene::Plus => quote! { __sqlx_sql.push_str("NULL"); },
+                        Kleene::Star => quote! {},
+                        _ => quote! {
+                            compile_error!("unsupported Kleene variant");
+                        },
+                    };
+                    quote! {
+                        let mut __sqlx_count = 0usize;
+                        for elem in (#name).into_iter() {
+                            if __sqlx_count > 0 { __sqlx_sql.push_str(", "); }
+                            __sqlx_args.add(elem)?;
+                            __sqlx_args
+                                .format_placeholder(&mut __sqlx_sql)
+                                .expect("writing to String is infallible");
+                            __sqlx_count += 1;
+                        }
+                        if __sqlx_count == 0 { #empty_filler }
+                    }
+                }
+            });
+        }
     }
 
-    let arg_names = (0..input.arg_exprs.len())
-        .map(|i| format_ident!("arg{}", i))
-        .collect::<Vec<_>>();
+    quote! {
+        #binding_setup
+        let mut __sqlx_sql = String::with_capacity(#cap_hint);
+        let mut __sqlx_args = <#db_path as ::sqlx::database::Database>::Arguments::default();
+        // IIFE so `?` from `Arguments::add` early-returns from this block,
+        // not the surrounding macro expansion.
+        let __sqlx_result: ::core::result::Result<(), ::sqlx::error::BoxDynError> = (|| {
+            #body
+            ::core::result::Result::Ok(())
+        })();
+        let query_args = __sqlx_result.map(|()| __sqlx_args);
+    }
+}
 
-    let arg_name = &arg_names;
-    let arg_expr = input.arg_exprs.iter().cloned().map(strip_wildcard);
-
-    let arg_bindings = quote! {
-        #(let #arg_name = &(#arg_expr);)*
+// SQL expression for the no-binding fast path. For `query_file!` we prefer
+// `include_str!` so the file participates in the compiler's source-tracking;
+// that's only possible when the rewriter's output is byte-identical to the
+// file content. `{{` / `}}` collapse outside skip regions modifies the text,
+// so for those queries we fall back to a string literal of the rewritten SQL.
+fn static_sql_expr(input: &QueryMacroInput, rewrite_out: &RewriteOutput) -> TokenStream {
+    let RuntimeTemplate::Static(sql) = &rewrite_out.runtime_template else {
+        unreachable!("static_sql_expr called on a non-static template")
     };
-
-    let args_check = match info.parameters() {
-        None | Some(Either::Right(_)) => {
-            // all we can do is check arity which we did
-            TokenStream::new()
+    if let Some(path) = &input.file_path {
+        if sql == &input.sql {
+            return quote_spanned! { input.src_span => include_str!(#path) };
         }
-
-        Some(Either::Left(_)) if !input.checked => {
-            // this is an `*_unchecked!()` macro invocation
-            TokenStream::new()
-        }
-
-        Some(Either::Left(params)) => {
-            params
-                .iter()
-                .zip(arg_names.iter().zip(&input.arg_exprs))
-                .enumerate()
-                .map(|(i, (param_ty, (name, expr)))| -> crate::Result<_> {
-                    if get_type_override(expr).is_some() {
-                        // cast will fail to compile if the type does not match
-                        // and we strip casts to wildcard
-                        return Ok(quote!());
-                    }
-
-                    let param_ty = get_param_type::<DB>(param_ty, config, warnings, i)?;
-
-                    Ok(quote_spanned!(expr.span() =>
-                        // this shouldn't actually run
-                        #[allow(clippy::missing_panics_doc, clippy::unreachable)]
-                        if false {
-                            use ::sqlx::ty_match::{WrapSameExt as _, MatchBorrowExt as _};
-
-                            // evaluate the expression only once in case it contains moves
-                            let expr = ::sqlx::ty_match::dupe_value(#name);
-
-                            // if `expr` is `Option<T>`, get `Option<$ty>`, otherwise `$ty`
-                            let ty_check = ::sqlx::ty_match::WrapSame::<#param_ty, _>::new(&expr).wrap_same();
-
-                            // if `expr` is `&str`, convert `String` to `&str`
-                            let (mut _ty_check, match_borrow) = ::sqlx::ty_match::MatchBorrow::new(ty_check, &expr);
-
-                            _ty_check = match_borrow.match_borrow();
-
-                            // this causes move-analysis to effectively ignore this block
-                            ::std::unreachable!();
-                        }
-                    ))
-                })
-                .collect::<crate::Result<TokenStream>>()?
-        }
-    };
-
-    let args_count = input.arg_exprs.len();
-
-    Ok(quote! {
-        #arg_bindings
-
-        #args_check
-
-        let mut query_args = <#db_path as ::sqlx::database::Database>::Arguments::default();
-        query_args.reserve(
-            #args_count,
-            0 #(+ ::sqlx::encode::Encode::<#db_path>::size_hint(#arg_name))*
-        );
-        let query_args = ::core::result::Result::<_, ::sqlx::error::BoxDynError>::Ok(query_args)
-        #(.and_then(move |mut query_args| query_args.add(#arg_name).map(move |()| query_args) ))*;
-    })
+    }
+    let lit = Literal::string(sql);
+    quote! { #lit }
 }
 
 fn get_param_type<DB: DatabaseExt>(

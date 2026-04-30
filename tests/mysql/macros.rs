@@ -586,3 +586,115 @@ async fn test_uuid_is_compatible_mariadb() -> anyhow::Result<()> {
 }
 
 // we don't emit bind parameter type-checks for MySQL so testing the overrides is redundant
+
+// `{...}` placeholder syntax (issue #875)
+
+#[sqlx_macros::test]
+async fn placeholder_positional() -> anyhow::Result<()> {
+    let mut conn = new::<sqlx::MySql>().await?;
+    let row = sqlx::query!("SELECT CAST({0} AS SIGNED) AS x", 42i32)
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(row.x, Some(42));
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn placeholder_named() -> anyhow::Result<()> {
+    let mut conn = new::<sqlx::MySql>().await?;
+    let row = sqlx::query!("SELECT CAST({id} AS SIGNED) AS x", id = 42i32)
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(row.x, Some(42));
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn placeholder_inline_capture() -> anyhow::Result<()> {
+    let mut conn = new::<sqlx::MySql>().await?;
+    let id = 42i32;
+    let row = sqlx::query!("SELECT CAST({id} AS SIGNED) AS x")
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(row.x, Some(42));
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn placeholder_spread_with_singles() -> anyhow::Result<()> {
+    let mut conn = new::<sqlx::MySql>().await?;
+    let row = sqlx::query!(
+        "SELECT count(*) AS n FROM (SELECT 1 AS x UNION SELECT 2 UNION SELECT 3) AS v \
+         WHERE x IN ({ids*}) AND x <= CAST({max} AS SIGNED)",
+        ids = &vec![1i32, 2],
+        max = 1i32,
+    )
+    .fetch_one(&mut conn)
+    .await?;
+    assert_eq!(row.n, 1);
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn placeholder_complex_expression() -> anyhow::Result<()> {
+    let mut conn = new::<sqlx::MySql>().await?;
+    struct Filter {
+        id: i32,
+    }
+    let f = Filter { id: 42 };
+    let row = sqlx::query!("SELECT CAST({(f.id)} AS SIGNED) AS x")
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(row.x, Some(42));
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn placeholder_question_mark_in_string_literal() -> anyhow::Result<()> {
+    // `?` inside a SQL string literal is not a native placeholder, and the
+    // rewriter must accept the query when it appears alongside `{...}`.
+    let mut conn = new::<sqlx::MySql>().await?;
+    let row = sqlx::query!("SELECT 'a?b' AS got WHERE 1 = {x}", x = 1i32)
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(row.got, "a?b");
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn placeholder_rest_spread_and_override() -> anyhow::Result<()> {
+    let mut conn = new::<sqlx::MySql>().await?;
+    #[allow(dead_code)] // `id` is unread because it's overridden by the named arg.
+    struct Filter {
+        id: i32,
+        x: i32,
+    }
+    let f = Filter { id: 99, x: 1 };
+    let row = sqlx::query!(
+        "SELECT CAST({id} AS SIGNED) AS id, CAST({x} AS SIGNED) AS x",
+        id = 1i32,
+        ..f
+    )
+    .fetch_one(&mut conn)
+    .await?;
+    assert_eq!(row.id, Some(1));
+    assert_eq!(row.x, Some(1));
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn placeholder_with_query_as() -> anyhow::Result<()> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        x: Option<i64>,
+    }
+    let mut conn = new::<sqlx::MySql>().await?;
+    // Force the column type via override: MySQL reports `SIGNED` as BIGINT but
+    // MariaDB reports it as INT for small literals, so an explicit cast keeps
+    // the test type stable across both.
+    let r = sqlx::query_as!(Row, r#"SELECT CAST({0} AS SIGNED) AS "x: i64""#, 42i32)
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(r.x, Some(42));
+    Ok(())
+}

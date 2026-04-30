@@ -660,3 +660,91 @@ async fn pghstore_tests() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// `{...}` placeholder syntax (issue #875) — Postgres exercises `$N` numbering.
+
+#[sqlx_macros::test]
+async fn placeholder_positional() -> anyhow::Result<()> {
+    let mut conn = new::<Postgres>().await?;
+    let n = sqlx::query_scalar!("SELECT {0}::int4", 42i32)
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(n, Some(42));
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn placeholder_named() -> anyhow::Result<()> {
+    let mut conn = new::<Postgres>().await?;
+    let n = sqlx::query_scalar!("SELECT {id}::int4", id = 42i32)
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(n, Some(42));
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn placeholder_inline_capture() -> anyhow::Result<()> {
+    let mut conn = new::<Postgres>().await?;
+    let id = 42i32;
+    let n = sqlx::query_scalar!("SELECT {id}::int4")
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(n, Some(42));
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn placeholder_spread_with_single_after_keeps_numbering() -> anyhow::Result<()> {
+    // The spread expands to `$1, $2`; `{max}` must come out as `$3`.
+    let mut conn = new::<Postgres>().await?;
+    let n = sqlx::query_scalar!(
+        "SELECT count(*)::int8 FROM (VALUES (1::int4), (2), (3)) v(x) \
+         WHERE x IN ({ids*}) AND x <= {max}::int4",
+        ids = &vec![1i32, 2],
+        max = 1i32,
+    )
+    .fetch_one(&mut conn)
+    .await?;
+    assert_eq!(n, Some(1));
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn placeholder_complex_expression() -> anyhow::Result<()> {
+    let mut conn = new::<Postgres>().await?;
+    struct Filter {
+        id: i32,
+    }
+    let f = Filter { id: 1 };
+    let n = sqlx::query_scalar!(
+        "SELECT count(*)::int8 FROM (VALUES (1::int4)) v(x) WHERE x = {(f.id)}"
+    )
+    .fetch_one(&mut conn)
+    .await?;
+    assert_eq!(n, Some(1));
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn placeholder_dollar_quote_left_alone() -> anyhow::Result<()> {
+    let mut conn = new::<Postgres>().await?;
+    // Braces inside a `$tag$ ... $tag$` block must NOT be interpreted as placeholders.
+    let s = sqlx::query_scalar!("SELECT $tag${x}$tag$::text")
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(s.as_deref(), Some("{x}"));
+    Ok(())
+}
+
+#[sqlx_macros::test]
+async fn placeholder_dollar_n_in_string_literal() -> anyhow::Result<()> {
+    // `$1` inside a SQL string literal is not a native placeholder, and the
+    // rewriter must accept the query when it appears alongside `{...}`.
+    let mut conn = new::<Postgres>().await?;
+    let s = sqlx::query_scalar!("SELECT '$1 cost'::text WHERE 1 = {x}::int4", x = 1i32)
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(s.as_deref(), Some("$1 cost"));
+    Ok(())
+}

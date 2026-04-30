@@ -25,6 +25,7 @@ pub use sqlx_core::query::query_with_result as __query_with_result;
 pub use sqlx_core::query::{query, query_with};
 pub use sqlx_core::query_as::{query_as, query_as_with};
 pub use sqlx_core::query_builder::{self, QueryBuilder};
+pub use sqlx_core::query_interp::{query_interp, InterpQuery};
 #[doc(hidden)]
 pub use sqlx_core::query_scalar::query_scalar_with_result as __query_scalar_with_result;
 pub use sqlx_core::query_scalar::{query_scalar, query_scalar_with};
@@ -157,6 +158,7 @@ pub use self::decode::Decode;
 pub mod query {
     pub use sqlx_core::query::{Map, Query};
     pub use sqlx_core::query_as::QueryAs;
+    pub use sqlx_core::query_interp::InterpQuery;
     pub use sqlx_core::query_scalar::QueryScalar;
 }
 

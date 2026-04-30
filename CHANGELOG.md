@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `{{` / `}}` are literal braces. Braces inside SQL string literals, comments, and Postgres dollar-quoted blocks are left alone. Mixing native (`$N`, `?`) and `{...}` placeholders in one query is a compile-time error. SQL containing no `{` characters is passed through verbatim.
 
+* `sqlx::query_interp` — runtime counterpart of `query!` for dynamically-built SQL. Accepts the same `{...}` syntax (no inline capture, no `..rest`, no `{(expr)}`); `.bind` / `.bind_named` / `.bind_iter` / `.bind_iter_named` populate bindings, and `.build()` / `.build_as` / `.build_scalar` produce a regular `Query` / `QueryAs` / `QueryScalar`.
+
 ## 0.9.0-alpha.1 - 2025-10-14
 
 Accumulated changes since the beginning of the alpha cycle. Effectively a draft CHANGELOG for the 0.9.0 release.

@@ -73,6 +73,7 @@ pub mod net;
 pub mod placeholders;
 pub mod query_as;
 pub mod query_builder;
+pub mod query_interp;
 pub mod query_scalar;
 pub mod sql_str;
 

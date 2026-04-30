@@ -298,6 +298,22 @@ let rows = sqlx::query!(
 // `{ids+}` expands to `NULL` for an empty array (matches no rows).
 ```
 
+If you need to build queries dynamically (where the SQL string isn't known at compile
+time and the macros don't apply), use `sqlx::query_interp` — the runtime counterpart
+of the macro. It accepts the same `{...}` placeholder syntax:
+
+```rust
+let ids: Vec<i32> = vec![1, 2, 3];
+let rows = sqlx::query_interp::<Postgres>("SELECT * FROM foo WHERE id IN ({ids*})")
+    .bind_iter_named("ids", ids)
+    .build()?
+    .fetch_all(&db)
+    .await?;
+```
+
+`query_interp` doesn't do compile-time type checking — type errors and bad bindings
+surface at execution time as `Error::Configuration` or as decode errors.
+
 **In Postgres** you can also use `= ANY()` with a bound array, which avoids generating
 a different query for each possible array length:
 

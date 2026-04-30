@@ -69,6 +69,8 @@ pub mod fs;
 pub mod io;
 pub mod logger;
 pub mod net;
+#[doc(hidden)]
+pub mod placeholders;
 pub mod query_as;
 pub mod query_builder;
 pub mod query_scalar;

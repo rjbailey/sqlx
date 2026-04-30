@@ -2,11 +2,15 @@ macro_rules! impl_database_ext {
     (
         $database:path,
         row: $row:path,
+        placeholder_char: $placeholder_char:expr,
+        param_indexing: $param_indexing:expr,
         $(describe-blocking: $describe:path,)?
     ) => {
         impl $crate::database::DatabaseExt for $database {
             const DATABASE_PATH: &'static str = stringify!($database);
             const ROW_PATH: &'static str = stringify!($row);
+            const PLACEHOLDER_CHAR: char = $placeholder_char;
+            const PARAM_INDEXING: $crate::database::ParamIndexing = $param_indexing;
             impl_describe_blocking!($database, $($describe)?);
         }
     }
@@ -55,18 +59,24 @@ mod sqlx {
 impl_database_ext! {
     sqlx::mysql::MySql,
     row: sqlx::mysql::MySqlRow,
+    placeholder_char: '?',
+    param_indexing: crate::database::ParamIndexing::Implicit,
 }
 
 #[cfg(feature = "postgres")]
 impl_database_ext! {
     sqlx::postgres::Postgres,
     row: sqlx::postgres::PgRow,
+    placeholder_char: '$',
+    param_indexing: crate::database::ParamIndexing::OneIndexed,
 }
 
 #[cfg(feature = "_sqlite")]
 impl_database_ext! {
     sqlx::sqlite::Sqlite,
     row: sqlx::sqlite::SqliteRow,
+    placeholder_char: '?',
+    param_indexing: crate::database::ParamIndexing::Implicit,
     // Since proc-macros don't benefit from async, we can make a describe call directly
     // which also ensures that the database is closed afterwards, regardless of errors.
     describe-blocking: sqlx_sqlite::describe_blocking,

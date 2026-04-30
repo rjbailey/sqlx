@@ -13,9 +13,24 @@ use std::sync::{LazyLock, Mutex};
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "_sqlite"))]
 mod impls;
 
+/// How a database driver indexes its parameter placeholders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ParamIndexing {
+    /// Anonymous, ordered by appearance in SQL: e.g. MySQL/SQLite's `?`.
+    Implicit,
+    /// 1-indexed numbered: e.g. Postgres' `$1`, `$2`.
+    OneIndexed,
+}
+
 pub trait DatabaseExt: Database + TypeChecking {
     const DATABASE_PATH: &'static str;
     const ROW_PATH: &'static str;
+    /// The character that introduces a parameter placeholder in the driver's
+    /// native SQL syntax (e.g. `'?'` for MySQL/SQLite, `'$'` for Postgres).
+    const PLACEHOLDER_CHAR: char;
+    /// The indexing scheme used by the driver's native placeholder syntax.
+    const PARAM_INDEXING: ParamIndexing;
 
     fn db_path() -> syn::Path {
         syn::parse_str(Self::DATABASE_PATH).unwrap()

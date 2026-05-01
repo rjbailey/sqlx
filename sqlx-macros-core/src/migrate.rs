@@ -129,7 +129,7 @@ pub fn expand_with_path(config: &Config, path: &Path) -> crate::Result<TokenStre
             )
         })?;
 
-        proc_macro::tracked::path(path);
+        proc_macro::tracked_path::path(path);
     }
 
     Ok(quote! {

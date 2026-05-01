@@ -71,7 +71,7 @@ impl MtimeCacheBuilder {
 
         #[cfg(any(sqlx_macros_unstable, procmacro2_semver_exempt))]
         {
-            proc_macro::tracked::path(&path);
+            proc_macro::tracked_path::path(path.to_string_lossy());
         }
 
         self.file_mtimes.push((path, mtime));
